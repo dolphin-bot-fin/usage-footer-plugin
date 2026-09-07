@@ -1,0 +1,745 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index e998f1a8..24de5465 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -966,9 +966,21 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+         if not callable(getattr(_completions, "prepare", None)):
+             api_kwargs.pop("_moa_prepared_request", None)
+-        return agent.client.chat.completions.create(**api_kwargs)
+-    request_client = make_client("chat_completion_request")
+-    return request_client.chat.completions.create(**api_kwargs)
++        resp = agent.client.chat.completions.create(**api_kwargs)
++    else:
++        request_client = make_client("chat_completion_request")
++        resp = request_client.chat.completions.create(**api_kwargs)
++
++    # Handle proxy envelopes (e.g. ClinePass) where response data is wrapped in {"data": ...}
++    if resp is not None and (not hasattr(resp, "choices") or resp.choices is None) and hasattr(resp, "data"):
++        data = getattr(resp, "data", None)
++        if isinstance(data, dict) and "choices" in data:
++            try:
++                from openai.types.chat.chat_completion import ChatCompletion
++                resp = ChatCompletion.model_validate(data)
++            except Exception:
++                pass
++    return resp
+ 
+ 
+ def should_use_direct_api_call(agent) -> bool:
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index ba11804a..012c1e52 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3085,9 +3085,9 @@ def run_conversation(
+                         response_invalid = True
+                         if response is None:
+                             error_details.append("response is None")
+-                        elif not hasattr(response, 'choices'):
++                        elif not hasattr(response, 'choices') and not (hasattr(response, 'data') and isinstance(getattr(response, 'data', None), dict) and response.data.get('choices')):
+                             error_details.append("response has no 'choices' attribute")
+-                        elif response.choices is None:
++                        elif response.choices is None and not (hasattr(response, 'data') and isinstance(getattr(response, 'data', None), dict) and response.data.get('choices')):
+                             error_details.append("response.choices is None")
+                         else:
+                             error_details.append("response.choices is empty")
+diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
+index f6f0cd51..d14529dd 100644
+--- a/agent/transports/chat_completions.py
++++ b/agent/transports/chat_completions.py
+@@ -813,6 +813,16 @@ class ChatCompletionsTransport(ProviderTransport):
+         unified format) and reasoning_content (DeepSeek/Moonshot) are also
+         preserved for downstream replay.
+         """
++        # Unwrap data envelope if present
++        if (not hasattr(response, "choices") or response.choices is None) and hasattr(response, "data"):
++            data = getattr(response, "data", None)
++            if isinstance(data, dict) and "choices" in data:
++                try:
++                    from openai.types.chat.chat_completion import ChatCompletion
++                    response = ChatCompletion.model_validate(data)
++                except Exception:
++                    pass
++
+         choice = response.choices[0]
+         msg = choice.message
+         # Poolside returns integer finish_reason (e.g. 24) instead of string
+@@ -929,6 +939,8 @@ class ChatCompletionsTransport(ProviderTransport):
+         if response is None:
+             return False
+         if not hasattr(response, "choices") or response.choices is None:
++            if hasattr(response, "data") and isinstance(getattr(response, "data", None), dict):
++                return bool(response.data.get("choices"))
+             return False
+         if not response.choices:
+             return False
+diff --git a/gateway/config.py b/gateway/config.py
+index a00fa0f9..c0ca7d3c 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -958,6 +958,7 @@ class GatewayConfig:
+     # STT settings
+     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
+     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
++    stt_voice_marker: bool = False  # Tag successful transcripts with a factual [voice] marker so the agent can tell the message arrived as voice
+ 
+     # Session isolation in shared chats
+     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
+@@ -1117,6 +1118,7 @@ class GatewayConfig:
+             "filter_silence_narration": self.filter_silence_narration,
+             "stt_enabled": self.stt_enabled,
+             "stt_echo_transcripts": self.stt_echo_transcripts,
++            "stt_voice_marker": self.stt_voice_marker,
+             "group_sessions_per_user": self.group_sessions_per_user,
+             "thread_sessions_per_user": self.thread_sessions_per_user,
+             "max_concurrent_sessions": self.max_concurrent_sessions,
+@@ -1181,6 +1183,13 @@ class GatewayConfig:
+                 if isinstance(data.get("stt"), dict)
+                 else None
+             )
++        stt_voice_marker = data.get("stt_voice_marker")
++        if stt_voice_marker is None:
++            stt_voice_marker = (
++                data.get("stt", {}).get("voice_marker")
++                if isinstance(data.get("stt"), dict)
++                else None
++            )
+ 
+         group_sessions_per_user = data.get("group_sessions_per_user")
+         thread_sessions_per_user = data.get("thread_sessions_per_user")
+@@ -1263,6 +1272,7 @@ class GatewayConfig:
+             ),
+             stt_enabled=_coerce_bool(stt_enabled, True),
+             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
++            stt_voice_marker=_coerce_bool(stt_voice_marker, False),
+             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
+             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
+             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+@@ -1391,6 +1401,10 @@ def load_gateway_config() -> GatewayConfig:
+                 gw_data["stt_echo_transcripts"] = yaml_cfg["stt_echo_transcripts"]
+             elif isinstance(gateway_section, dict) and "stt_echo_transcripts" in gateway_section:
+                 gw_data["stt_echo_transcripts"] = gateway_section["stt_echo_transcripts"]
++            if "stt_voice_marker" in yaml_cfg:
++                gw_data["stt_voice_marker"] = yaml_cfg["stt_voice_marker"]
++            elif isinstance(gateway_section, dict) and "stt_voice_marker" in gateway_section:
++                gw_data["stt_voice_marker"] = gateway_section["stt_voice_marker"]
+ 
+             gateway_cfg = yaml_cfg.get("gateway")
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index e59af635..31a10aed 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -6124,6 +6124,13 @@ class TurnRunner:
+             _output_toks = getattr(_agent, "session_completion_tokens", 0)
+             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+         _resolved_model = getattr(_agent, "model", None) if _agent else None
++        # Preserve the provider that actually answered this turn.  The runtime
++        # footer consumes the TurnRunner result; without this field a GPT model
++        # falls back to the legacy model-name heuristic and is mislabeled as
++        # OpenRouter even when it ran through openai-codex.
++        _resolved_provider = getattr(_agent, "provider", None) if _agent else None
++        if not _resolved_provider:
++            _resolved_provider = runtime_kwargs.get("provider")
+ 
+         # Sync session_id immediately after run_conversation(). Compression
+         # can rotate before a follow-up model call fails; the failure return
+@@ -6259,6 +6266,7 @@ class TurnRunner:
+                 "input_tokens": _input_toks,
+                 "output_tokens": _output_toks,
+                 "model": _resolved_model,
++                "provider": _resolved_provider,
+                 "context_length": _context_length,
+             }
+ 
+@@ -6340,6 +6348,7 @@ class TurnRunner:
+             "input_tokens": _input_toks,
+             "output_tokens": _output_toks,
+             "model": _resolved_model,
++            "provider": _resolved_provider,
+             "context_length": _context_length,
+             "session_id": effective_session_id,
+             "response_previewed": result.get("response_previewed", False),
+@@ -19843,6 +19852,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             # text, so we fire a separate trailing send below.
+             _footer_line = ""
+             try:
++                import sys, importlib
++                if "gateway.runtime_footer" in sys.modules:
++                    importlib.reload(sys.modules["gateway.runtime_footer"])
+                 from gateway.runtime_footer import build_footer_line as _bfl
+                 _footer_line = _bfl(
+                     user_config=_load_gateway_config(),
+@@ -19852,6 +19864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     context_length=agent_result.get("context_length") or None,
+                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                     turn_seconds=_turn_seconds,
++                    provider=agent_result.get("provider", ""),
+                 )
+             except Exception as _footer_err:
+                 logger.debug("runtime_footer build failed: %s", _footer_err)
+@@ -24027,12 +24040,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         )
+                         continue
+                     successful_transcripts.append(transcript)
+-                    # Pass the transcript through as a plain quoted line. The
+-                    # earlier wording ("The user sent a voice message~ Here's
+-                    # what they said: ...") read as a meta-instruction and made
+-                    # the LLM volunteer commentary about voice mode rather than
+-                    # reply to the content.
+-                    enriched_parts.append(f'"{transcript}"')
++                    # Pass the transcript through as a plain quoted line by
++                    # default. When stt.voice_marker is enabled, tag it with a
++                    # minimal factual marker so the agent can tell the message
++                    # arrived as voice (useful for personal-assistant setups
++                    # that reply in voice) WITHOUT a meta-instruction that
++                    # invites commentary about "voice mode". The earlier wording
++                    # ("The user sent a voice message~ Here's what they said:
++                    # ...") read as a meta-instruction and made the LLM
++                    # volunteer commentary about voice mode rather than reply
++                    # to the content.
++                    if getattr(self.config, "stt_voice_marker", False):
++                        enriched_parts.append(f'[voice] "{transcript}"')
++                    else:
++                        enriched_parts.append(f'"{transcript}"')
+                 else:
+                     error = result.get("error", "unknown error")
+                     # All failure branches: a single, minimal, neutral marker.
+diff --git a/gateway/runtime_footer.py b/gateway/runtime_footer.py
+index 8719524d..5653920e 100644
+--- a/gateway/runtime_footer.py
++++ b/gateway/runtime_footer.py
+@@ -13,7 +13,7 @@ Config (``~/.hermes/config.yaml``)::
+ 
+ Available fields:
+     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
+-    context_pct  — last-call context occupancy as a percent (``5%``)
++    context_pct  — progress toward the default compaction point (``10% context``)
+     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
+     cwd          — home-relative working dir (``~``)
+ 
+@@ -40,6 +40,127 @@ from typing import Any, Iterable, Optional
+ _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
+ _SEP = " · "
+ 
++_CLINE_LIMIT_CACHE: dict[str, Any] = {"ts": 0.0, "percent": None}
++_CODEX_LIMIT_CACHE: dict[str, Any] = {"ts": 0.0, "percent": None}
++_OPENROUTER_USAGE_CACHE: dict[str, Any] = {"ts": 0.0, "daily_spend": None}
++
++
++def _get_cline_five_hour_percent() -> Optional[int]:
++    """Fetch percentUsed from Cline limits endpoint with 30s in-memory cache."""
++    import json
++    import time
++    import urllib.request
++    from pathlib import Path
++
++    now = time.time()
++    if now - _CLINE_LIMIT_CACHE["ts"] < 30.0 and _CLINE_LIMIT_CACHE["percent"] is not None:
++        return _CLINE_LIMIT_CACHE["percent"]
++
++    api_key = os.environ.get("CLINE_API_KEY") or os.environ.get("Cline_API_KEY")
++    if not api_key:
++        env_file = Path(os.path.expanduser("~/.hermes/.env"))
++        if env_file.exists():
++            try:
++                for line in env_file.read_text().splitlines():
++                    line = line.strip()
++                    if line.startswith("Cline_API_KEY=") or line.startswith("CLINE_API_KEY="):
++                        api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
++                        break
++            except Exception:
++                pass
++
++    if not api_key:
++        return None
++
++    try:
++        req = urllib.request.Request(
++            "https://api.cline.bot/api/v1/users/me/plan/usage-limits",
++            headers={"Authorization": f"Bearer {api_key}", "User-Agent": "hermes-agent"}
++        )
++        with urllib.request.urlopen(req, timeout=5) as resp:
++            data = json.loads(resp.read().decode())
++            limits = data.get("data", {}).get("limits", [])
++            for lim in limits:
++                if lim.get("type") == "five_hour":
++                    pct = lim.get("percentUsed")
++                    if pct is not None:
++                        val = int(round(pct))
++                        _CLINE_LIMIT_CACHE["ts"] = now
++                        _CLINE_LIMIT_CACHE["percent"] = val
++                        return val
++    except Exception:
++        pass
++    return None
++
++
++def _get_codex_five_hour_remaining_percent() -> Optional[int]:
++    """Return the Codex session-window percentage remaining, cached for 30s."""
++    import time
++
++    now = time.time()
++    if now - _CODEX_LIMIT_CACHE["ts"] < 30.0 and _CODEX_LIMIT_CACHE["percent"] is not None:
++        return _CODEX_LIMIT_CACHE["percent"]
++
++    try:
++        from agent.account_usage import fetch_account_usage
++
++        snapshot = fetch_account_usage("openai-codex")
++        for window in snapshot.windows if snapshot else ():
++            if window.label == "Session" and window.used_percent is not None:
++                remaining = max(0, min(100, round(100 - float(window.used_percent))))
++                _CODEX_LIMIT_CACHE["ts"] = now
++                _CODEX_LIMIT_CACHE["percent"] = remaining
++                return remaining
++    except Exception:
++        pass
++    return None
++
++
++def _get_openrouter_daily_spend() -> Optional[float]:
++    """Fetch usage_daily from OpenRouter auth/key endpoint with 30s cache."""
++    import json
++    import time
++    import urllib.request
++    from pathlib import Path
++
++    now = time.time()
++    if now - _OPENROUTER_USAGE_CACHE["ts"] < 30.0 and _OPENROUTER_USAGE_CACHE["daily_spend"] is not None:
++        return _OPENROUTER_USAGE_CACHE["daily_spend"]
++
++    api_key = os.environ.get("OPENROUTER_API_KEY")
++    if not api_key:
++        env_file = Path(os.path.expanduser("~/.hermes/.env"))
++        if env_file.exists():
++            try:
++                for line in env_file.read_text().splitlines():
++                    line = line.strip()
++                    if line.startswith("OPENROUTER_API_KEY="):
++                        api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
++                        break
++            except Exception:
++                pass
++
++    if not api_key:
++        return None
++
++    try:
++        req = urllib.request.Request(
++            "https://openrouter.ai/api/v1/auth/key",
++            headers={"Authorization": f"Bearer {api_key}", "User-Agent": "hermes-agent"}
++        )
++        with urllib.request.urlopen(req, timeout=5) as resp:
++            data = json.loads(resp.read().decode())
++            key_data = data.get("data", {})
++            daily = key_data.get("usage_daily")
++            if daily is not None:
++                val = float(daily)
++                _OPENROUTER_USAGE_CACHE["ts"] = now
++                _OPENROUTER_USAGE_CACHE["daily_spend"] = val
++                return val
++    except Exception:
++        pass
++    return None
++
+ 
+ def _home_relative_cwd(cwd: str) -> str:
+     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
+@@ -115,6 +236,7 @@ def format_runtime_footer(
+     context_length: Optional[int],
+     cwd: Optional[str] = None,
+     turn_seconds: Optional[float] = None,
++    provider: Optional[str] = None,
+     fields: Iterable[str] = _DEFAULT_FIELDS,
+ ) -> str:
+     """Render the footer line, or return "" if no fields have data.
+@@ -122,16 +244,74 @@ def format_runtime_footer(
+     Fields are skipped silently when their underlying data is missing — a
+     partially-populated footer is better than a line with ``?%`` or empty slots.
+     """
++    prov_str = str(provider or "").strip().lower()
++    mod_str = str(model or "").strip().lower()
++
++    # An explicit provider is authoritative. Model-name inference is only a
++    # fallback for older call sites that do not pass provider metadata.
++    is_codex = prov_str == "openai-codex"
++    has_explicit_provider = prov_str not in {"", "auto", "custom"}
++    is_cline = "cline" in prov_str or (
++        not has_explicit_provider
++        and ("cline" in mod_str or "kimi" in mod_str or "deepseek" in mod_str)
++    )
++    is_openrouter = "openrouter" in prov_str or (
++        not has_explicit_provider
++        and ("gemini" in mod_str or "claude" in mod_str or "gpt" in mod_str)
++    )
++    if is_codex:
++        is_cline = False
++        is_openrouter = False
++    elif "openrouter" in prov_str:
++        is_cline = False
++        is_openrouter = True
++    elif "cline" in prov_str:
++        is_cline = True
++        is_openrouter = False
++
+     parts: list[str] = []
+     for field in fields:
+-        if field == "model":
++        if field == "provider" or field == "provider_label":
++            if is_codex:
++                parts.append("OpenAI Codex")
++            elif is_cline:
++                parts.append("ClinePass")
++            elif is_openrouter:
++                parts.append("OpenRouter")
++            elif prov_str:
++                parts.append(prov_str.title())
++        elif field == "model":
+             m = _model_short(model)
+             if m:
+                 parts.append(m)
+         elif field == "context_pct":
+             if context_length and context_length > 0 and context_tokens >= 0:
+-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
+-                parts.append(f"{pct}%")
++                # The configured base compaction threshold is 50% of the
++                # context window, so express usage as progress toward that
++                # point rather than as a percentage of the full window.
++                pct = max(0, min(100, round((context_tokens / context_length) * 200)))
++                parts.append(f"{pct}% context")
++        elif field in ("provider_usage", "provider_custom", "provider_limit"):
++            if is_codex:
++                remaining = _get_codex_five_hour_remaining_percent()
++                if remaining is not None:
++                    parts.append(f"{remaining}% 5h left")
++            elif is_cline:
++                limit_pct = _get_cline_five_hour_percent()
++                if limit_pct is not None:
++                    parts.append(f"{limit_pct}% 5h limit")
++            elif is_openrouter:
++                daily = _get_openrouter_daily_spend()
++                if daily is not None:
++                    parts.append(f"${daily:.2f} daily")
++        elif field in ("cline_5h_limit", "5h_limit", "hourly_limit"):
++            limit_pct = _get_cline_five_hour_percent()
++            if limit_pct is not None:
++                parts.append(f"{limit_pct}% 5h limit")
++        elif field in ("openrouter_daily", "daily_spend"):
++            daily = _get_openrouter_daily_spend()
++            if daily is not None:
++                parts.append(f"${daily:.2f} daily")
+         elif field == "latency":
+             # Wall-clock turn duration. Skipped when the caller supplied no
+             # timing (call sites that don't measure) or the value is negative.
+@@ -157,6 +337,7 @@ def build_footer_line(
+     context_length: Optional[int],
+     cwd: Optional[str] = None,
+     turn_seconds: Optional[float] = None,
++    provider: Optional[str] = None,
+ ) -> str:
+     """Top-level entry point used by gateway/run.py.
+ 
+@@ -171,11 +352,28 @@ def build_footer_line(
+     cfg = resolve_footer_config(user_config, platform_key)
+     if not cfg.get("enabled"):
+         return ""
++
++    # Older gateway turns did not include ``provider`` in their result dict.
++    # Prefer the configured default provider over model-name guessing so a GPT
++    # model routed through openai-codex cannot be mislabeled as OpenRouter.  A
++    # non-empty per-turn provider remains authoritative (including fallbacks).
++    if not provider and isinstance(user_config, dict):
++        model_cfg = user_config.get("model")
++        if isinstance(model_cfg, dict):
++            configured_provider = model_cfg.get("provider")
++            if not configured_provider:
++                default_model = model_cfg.get("default")
++                if isinstance(default_model, dict):
++                    configured_provider = default_model.get("provider")
++            if isinstance(configured_provider, str):
++                provider = configured_provider.strip() or None
++
+     return format_runtime_footer(
+         model=model,
+         context_tokens=context_tokens,
+         context_length=context_length,
+         cwd=cwd,
+         turn_seconds=turn_seconds,
++        provider=provider,
+         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+     )
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 4738aa42..461577ef 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1375,7 +1375,7 @@ DEFAULT_CONFIG = {
+         },
+         # Gateway runtime-metadata footer appended to the FINAL message of a turn
+         # (disabled by default to keep replies minimal). When enabled, renders
+-        # e.g. `model · 68% · ~/projects/hermes`. Per-platform overrides go under
++        # e.g. `model · 60% context · ~/projects/hermes`. Per-platform overrides go under
+         # display.platforms.<platform>.runtime_footer.
+         "runtime_footer": {
+             "enabled": False,
+diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
+index 20884cb3..53f4f192 100644
+--- a/hermes_cli/providers.py
++++ b/hermes_cli/providers.py
+@@ -525,6 +525,34 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
+             source="hermes",
+         )
+ 
++    # 3. Plugin-registered provider profiles (providers/ + user plugins in
++    #    $HERMES_HOME/plugins/model-providers/). These register via
++    #    `register_provider(ProviderProfile(...))` and are visible to the
++    #    /model picker (cached_provider_model_ids -> get_provider_profile)
++    #    but, until here, were NOT resolvable through resolve_provider_full /
++    #    get_provider -- so picking a non-default model under such a provider
++    #    (e.g. cline-pass/deepseek-v4-pro) failed with "Unknown provider
++    #    'cline'." Convert the profile's endpoint/env vars into a ProviderDef
++    #    so the switch resolver and CLI both route to the right base_url.
++    try:
++        from providers import get_provider_profile as _plugin_profile
++
++        _prof = _plugin_profile(name)
++        if _prof is not None and _prof.base_url:
++            return ProviderDef(
++                id=canonical,
++                name=_prof.display_name or _prof.name or canonical,
++                transport=getattr(_prof, "transport", None) or "openai_chat",
++                api_key_env_vars=tuple(_prof.env_vars or ()),
++                base_url=_prof.base_url,
++                base_url_env_var="",
++                is_aggregator=False,
++                auth_type="api_key",
++                source="provider-profile-plugin",
++            )
++    except Exception:
++        pass
++
+     return None
+ 
+ 
+diff --git a/tests/gateway/test_runtime_footer.py b/tests/gateway/test_runtime_footer.py
+index 1ca63a90..4db02d8c 100644
+--- a/tests/gateway/test_runtime_footer.py
++++ b/tests/gateway/test_runtime_footer.py
+@@ -7,6 +7,7 @@ import os
+ 
+ import pytest
+ 
++import gateway.runtime_footer as footer_mod
+ from gateway.runtime_footer import (
+     _home_relative_cwd,
+     _model_short,
+@@ -57,7 +58,7 @@ def test_format_footer_all_fields(monkeypatch, tmp_path):
+         cwd=None,  # falls back to TERMINAL_CWD env var
+         fields=("model", "context_pct", "cwd"),
+     )
+-    assert out == "gpt-5.4 · 68% · ~/projects/hermes"
++    assert out == "gpt-5.4 · 100% context · ~/projects/hermes"
+ 
+ 
+ def test_format_footer_skips_missing_context_length():
+@@ -133,6 +134,70 @@ def test_build_footer_per_platform_off_suppresses():
+     assert out == ""
+ 
+ 
++def test_build_footer_uses_configured_provider_when_turn_result_omits_it():
++    """Hot-reload fallback for gateways started before provider propagation."""
++    user = {
++        "model": {
++            "default": "gpt-5.6-sol",
++            "provider": "openai-codex",
++        },
++        "display": {
++            "runtime_footer": {
++                "enabled": True,
++                "fields": ["provider"],
++            }
++        },
++    }
++
++    out = build_footer_line(
++        user_config=user,
++        platform_key="telegram",
++        model="gpt-5.6-sol",
++        provider="",
++        context_tokens=10,
++        context_length=100,
++    )
++
++    assert out == "OpenAI Codex"
++
++
++def test_openai_codex_footer_shows_five_hour_remaining_not_openrouter_spend(monkeypatch):
++    """An explicit Codex provider must win over the GPT model-name fallback."""
++    from agent import account_usage
++    from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
++    from datetime import datetime, timezone
++
++    snapshot = AccountUsageSnapshot(
++        provider="openai-codex",
++        source="usage_api",
++        fetched_at=datetime.now(timezone.utc),
++        windows=(AccountUsageWindow(label="Session", used_percent=41.0),),
++    )
++    monkeypatch.setattr(account_usage, "fetch_account_usage", lambda provider: snapshot)
++    monkeypatch.setattr(
++        footer_mod,
++        "_CODEX_LIMIT_CACHE",
++        {"ts": 0.0, "percent": None},
++        raising=False,
++    )
++
++    def _unexpected_openrouter_fetch():
++        raise AssertionError("OpenRouter usage must not be fetched for openai-codex")
++
++    monkeypatch.setattr(footer_mod, "_get_openrouter_daily_spend", _unexpected_openrouter_fetch)
++
++    out = format_runtime_footer(
++        model="gpt-5.6-sol",
++        provider="openai-codex",
++        context_tokens=0,
++        context_length=100_000,
++        cwd="",
++        fields=("provider", "provider_usage"),
++    )
++
++    assert out == "OpenAI Codex · 59% 5h left"
++
++
+ 
+ # ---------------------------------------------------------------------------
+ # latency — opt-in wall-clock turn duration
+@@ -222,7 +287,7 @@ def test_format_footer_latency_in_field_order(monkeypatch, tmp_path):
+         turn_seconds=65.0,
+         fields=("model", "context_pct", "latency", "cwd"),
+     )
+-    assert out == "gpt-5.4 · 68% · 1m05s · ~"
++    assert out == "gpt-5.4 · 100% context · 1m05s · ~"
+ 
+ 
+ def test_build_footer_line_threads_turn_seconds(monkeypatch):
+@@ -275,11 +340,11 @@ def test_resolve_footer_config_default_fields_exclude_latency():
+ @pytest.mark.parametrize(
+     "model,tokens,window,cwd,expected",
+     [
+-        ("openai/gpt-5.4", 50_247, 1_000_000, "/var/data", "gpt-5.4 · 5% · /var/data"),
+-        ("claude-opus-4-8", 68_000, 100_000, "/var/data", "claude-opus-4-8 · 68% · /var/data"),
++        ("openai/gpt-5.4", 50_247, 1_000_000, "/var/data", "gpt-5.4 · 10% context · /var/data"),
++        ("claude-opus-4-8", 68_000, 100_000, "/var/data", "claude-opus-4-8 · 100% context · /var/data"),
+         ("m", 0, None, "/var/data", "m · /var/data"),
+-        ("", 10, 100, "/var/data", "10% · /var/data"),
+-        ("m", 10, 100, "", "m · 10%"),
++        ("", 10, 100, "/var/data", "20% context · /var/data"),
++        ("m", 10, 100, "", "m · 20% context"),
+     ],
+ )
+ def test_default_footer_renders_byte_identically(
+@@ -315,5 +380,5 @@ def test_default_build_footer_line_ignores_turn_seconds(monkeypatch):
+     )
+     baseline = build_footer_line(**common)
+     with_timing = build_footer_line(**common, turn_seconds=125.0)
+-    assert baseline == "gpt-5.4 · 5% · /var/data"
++    assert baseline == "gpt-5.4 · 10% context · /var/data"
+     assert with_timing == baseline
+diff --git a/tests/gateway/test_turn_context.py b/tests/gateway/test_turn_context.py
+index 48bfbf8e..d6f52031 100644
+--- a/tests/gateway/test_turn_context.py
++++ b/tests/gateway/test_turn_context.py
+@@ -145,3 +145,80 @@ class TestTurnRunner:
+             "Context length exceeded. Cannot compress further."
+         )
+         assert result["compression_exhausted"] is True
++
++    def test_run_result_preserves_resolved_provider_for_runtime_footer(self):
++        """The gateway footer must receive the provider that answered the turn."""
++
++        class _CodexAgent:
++            def __init__(self, **kwargs):
++                self.model = kwargs["model"]
++                self.provider = kwargs.get("provider")
++                self.session_id = kwargs["session_id"]
++                self.tools = []
++                self.context_compressor = SimpleNamespace(
++                    last_prompt_tokens=1_000,
++                    context_length=200_000,
++                )
++                self.session_prompt_tokens = 1_000
++                self.session_completion_tokens = 20
++
++            def run_conversation(self, _message, **_kwargs):
++                return {
++                    "final_response": "Answered by Codex.",
++                    "messages": [],
++                }
++
++        gateway_runner = MagicMock()
++        gateway_runner.config = SimpleNamespace(streaming=None)
++        gateway_runner._provider_routing = {}
++        gateway_runner._agent_cache_lock = None
++        gateway_runner._agent_cache = {}
++        gateway_runner._session_db = None
++        gateway_runner._prefill_messages = None
++        gateway_runner._pending_model_notes = {}
++        gateway_runner._pending_skills_reload_notes = {}
++        gateway_runner.session_store._entries = {}
++        gateway_runner._get_system_prompt_for_channel.return_value = None
++        gateway_runner._resolve_session_agent_runtime.return_value = (
++            "gpt-5.6-sol",
++            {"provider": "openai-codex"},
++        )
++        gateway_runner._resolve_session_reasoning_config.return_value = None
++        gateway_runner._resolve_session_service_tier.return_value = None
++        gateway_runner._resolve_turn_agent_config.return_value = {
++            "model": "gpt-5.6-sol",
++            "runtime": {"provider": "openai-codex"},
++        }
++        gateway_runner._agent_config_signature.return_value = ("test-signature",)
++        gateway_runner._extract_cache_busting_config.return_value = {}
++        gateway_runner._refresh_fallback_model.return_value = None
++        gateway_runner._consume_pending_native_image_paths.return_value = []
++        gateway_runner._consume_pending_turn_sidecar_notes.return_value = []
++        gateway_runner._is_telegram_topic_lane.return_value = False
++        gateway_runner._is_discord_auto_thread_lane.return_value = False
++        gateway_runner._is_relay_discord_channel_lane.return_value = False
++
++        source = SessionSource(
++            platform=Platform.LOCAL,
++            chat_id="test-chat",
++            user_id="test-user",
++        )
++        ctx = TurnContext(
++            source=source,
++            message="continue",
++            history=[],
++            session_id="test-session",
++            session_key="test-session-key",
++            user_config={},
++            AIAgent=_CodexAgent,
++            resolve_display_setting=lambda *_args: False,
++            _run_still_current=lambda: True,
++            _hooks_ref=SimpleNamespace(loaded_hooks=False),
++        )
++
++        from gateway.run import TurnRunner
++
++        result = TurnRunner(gateway_runner, ctx).run_sync()
++
++        assert result["model"] == "gpt-5.6-sol"
++        assert result["provider"] == "openai-codex"
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 42af4f30..e924861d 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1864,7 +1864,7 @@ Supported fields:
+ | Field | Renders | Example |
+ | --- | --- | --- |
+ | `model` | Bare model id, vendor prefix dropped | `gpt-5.4` |
+-| `context_pct` | Last-call context occupancy as a percent | `5%` |
++| `context_pct` | Progress toward the default 50% compaction point | `10% context` |
+ | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
+ | `cwd` | Home-relative working directory | `~` |
+ 
