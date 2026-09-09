@@ -1,0 +1,5 @@
+name: usage-footer
+version: 1.0.0
+description: "Extends the gateway runtime footer with live provider usage: Cline 5h, OpenCode rolling/weekly/monthly, OpenRouter daily spend, OpenAI (Codex) session, and Anthropic (Claude) session. Rides core's display.runtime_footer pipeline — /usage-footer for status."
+author: "Curtis Mortensen (dolphin-bot-fin)"
+kind: standalone

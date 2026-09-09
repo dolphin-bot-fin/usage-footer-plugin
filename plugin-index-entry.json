@@ -1,0 +1,12 @@
+{
+  "name": "usage-footer",
+  "description": "Live provider usage in the Hermes gateway runtime footer: Cline 5h %, OpenCode rolling/weekly/monthly %, OpenRouter daily/weekly spend, OpenAI (Codex) session %, Anthropic (Claude) session %. Renders through core's display.runtime_footer pipeline via a fail-open runtime anchor — zero core edits. Config-driven fields and refresh interval; /usage-footer status command.",
+  "author": "dolphin-bot-fin",
+  "tags": ["usage", "footer", "limits", "cline", "opencode", "openrouter", "openai", "anthropic", "gateway"],
+  "repo": "dolphin-bot-fin/usage-footer-plugin",
+  "ref": "21a4c2058df856d7bba22bc52523a0c264d9646a",
+  "homepage": "https://github.com/dolphin-bot-fin/usage-footer-plugin",
+  "capabilities": ["commands"],
+  "api_version": 1,
+  "added_at": "2026-09-09"
+}
